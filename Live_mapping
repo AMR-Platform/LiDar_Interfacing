@@ -1,0 +1,156 @@
+import socket
+import struct
+import math
+import time
+import numpy as np
+import cv2
+
+# LiDAR parameters
+UDP_IP = ""              # listen on all interfaces
+UDP_PORT = 2368          # default MSOP port for LakiBeam 1S:contentReference[oaicite:11]{index=11}
+FOV_START = 45.0         # FOV start angle (degrees)
+FOV_END   = 315.0        # FOV end angle (degrees)
+
+# Visualization parameters
+scale = 100  # pixels per meter (adjust for zoom level)
+img_size = 1000  # image width and height in pixels
+center = (img_size // 2, img_size // 2)
+
+# Prepare color map for RSSI (0-255 -> BGR color). Using OpenCV's JET colormap.
+rssi_colormap = cv2.applyColorMap(np.arange(256, dtype=np.uint8).reshape(-1,1), cv2.COLORMAP_JET)
+rssi_colormap = rssi_colormap[:, 0, :]  # shape (256,3)
+
+# Pre-draw static background (grid lines and 1m circle)
+background = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+# 1-meter radius circle
+cv2.circle(background, center, int(scale * 1.0), (100,100,100), 1)
+# Radial lines every 30 degrees
+radius_px = center[0]  # radius reaching image bounds (center to edge)
+for angle_deg in range(0, 360, 30):
+    angle_rad = math.radians(angle_deg)
+    x_end = int(center[0] + radius_px * math.cos(angle_rad))
+    y_end = int(center[1] - radius_px * math.sin(angle_rad))
+    cv2.line(background, center, (x_end, y_end), (80,80,80), 1)
+
+# Set up UDP socket for receiving LiDAR data
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.setblocking(False)  # non-blocking mode
+
+# Data structures for persistent point storage
+last_points = {}  # map angle (in hundredths of degree) -> (distance_m, rssi)
+points_in_frame = set()  # track updated angles in current frame (for point count)
+prev_angle = None
+last_frame_time = None
+fps = 0.0
+last_frame_point_count = 0
+
+print("Listening for LiDAR data on UDP port", UDP_PORT, "...")
+while True:
+    # Receive all available UDP packets
+    packet = None
+    try:
+        packet, addr = sock.recvfrom(1500)  # buffer size 1500 bytes
+    except BlockingIOError:
+        pass  # no packet available right now
+    # Process the packet if received
+    if packet:
+        data = packet
+        if len(data) < 1206:
+            continue  # skip if packet is not the expected size
+        # Parse the 12 data blocks in this packet
+        for blk in range(12):
+            offset = blk * 100
+            flag = data[offset] << 8 | data[offset+1]
+            if flag != 0xFFEE:  # check block header flag
+                continue  # skip if not a valid data block (or 0xFFFF indicating no data)
+            # Read block azimuth (0.01° units, big-endian)
+            azimuth_raw = data[offset+2] << 8 | data[offset+3]
+            if azimuth_raw == 0xFFFF:
+                continue  # invalid block (padding)
+            # Determine the azimuth of next block for interpolation
+            if blk < 11:
+                next_az_raw = data[offset+102] << 8 | data[offset+103]  # azimuth of next block
+                if next_az_raw == 0xFFFF:
+                    next_az_raw = None
+            else:
+                next_az_raw = None  # last block in packet, next might be in next packet
+            # Calculate angle increment per point in this block
+            if next_az_raw is not None:
+                az_diff = next_az_raw - azimuth_raw
+                if az_diff < 0:  # handle wrap-around (315° -> 45°)
+                    az_diff += 36000  # add 360° in hundredths (36000)
+                angle_increment = az_diff / 16.0
+            else:
+                # If we don't have a next block azimuth (end of scan or invalid), assume no increment
+                angle_increment = 0
+            # Parse the 16 measurements in this block
+            for i in range(16):
+                # Compute angle for this measurement in degrees
+                angle_raw = azimuth_raw + angle_increment * i
+                if angle_raw >= 36000:
+                    angle_raw -= 36000  # wrap within 0-35999 (hundredths of deg)
+                angle_deg = angle_raw / 100.0
+                # Only proceed if angle is within the LiDAR's configured FOV
+                if not (FOV_START <= angle_deg <= FOV_END):
+                    continue
+                # Extract the measurement data (big-endian distances)
+                idx = offset + 4 + i*6
+                dist_strong = data[idx] << 8 | data[idx+1]
+                rssi_strong = data[idx+2]
+                dist_last   = data[idx+3] << 8 | data[idx+4]
+                rssi_last   = data[idx+5]
+                # Use the strongest return (ignore last return for simplicity)
+                if dist_strong == 0 or dist_strong == 0xFFFF:
+                    # No valid return for this angle in this block
+                    continue
+                # Convert distance to meters
+                distance_m = dist_strong / 1000.0  # mm -> m:contentReference[oaicite:12]{index=12}
+                # Store/update this angle's point (for persistent display)
+                angle_key = int(round(angle_raw))  # use integer (hundredth-deg) as key
+                last_points[angle_key] = (distance_m, rssi_strong)
+                points_in_frame.add(angle_key)
+                # Detect rotation wrap-around (315° -> 45°) for FPS calculation
+                if prev_angle is not None and angle_deg < prev_angle - 180.0:
+                    curr_time = time.time()
+                    if last_frame_time is not None:
+                        delta = curr_time - last_frame_time
+                        if delta > 0:
+                            fps = 1.0 / delta
+                    last_frame_time = curr_time
+                    last_frame_point_count = len(points_in_frame)
+                    points_in_frame.clear()
+
+                prev_angle = angle_deg
+    # Visualization: draw the latest point cloud
+    display_img = background.copy()
+    # Draw all persistent points
+    for angle_key, (dist, rssi) in last_points.items():
+        # Compute Cartesian coordinates (in pixels)
+        ang = angle_key / 100.0  # angle in degrees
+        rad = math.radians(ang)
+        x = dist * math.cos(rad)
+        y = dist * math.sin(rad)
+        px = int(center[0] + x * scale)
+        py = int(center[1] - y * scale)
+        # Skip if outside image bounds
+        if not (0 <= px < img_size and 0 <= py < img_size):
+            continue
+        # Determine color from RSSI using the colormap
+        rssi_val = int(rssi) & 0xFF
+        color = tuple(int(c) for c in rssi_colormap[rssi_val])
+        # Draw the point (small filled circle)
+        cv2.circle(display_img, (px, py), 2, color, -1)
+    # Overlay FPS and point count text
+    cv2.putText(display_img, f"FPS: {fps:.1f}", (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(display_img, f"Points: {last_frame_point_count}", (10, 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    # Show the image
+    cv2.imshow("LakiBeam 1S LiDAR", display_img)
+    if cv2.waitKey(1) == 27:  # Press 'Esc' to quit
+        break
+
+# Cleanup
+sock.close()
+cv2.destroyAllWindows()
